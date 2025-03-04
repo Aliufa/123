@@ -1,0 +1,1547 @@
+// Библиотека для работы с Wi-Fi на ESP32. Позволяет подключаться к сети,
+// создавать точку доступа и управлять соединением.
+#include <WiFi.h>
+
+// Библиотека для создания встроенного веб-сервера на ESP32. Позволяет обрабатывать HTTP-запросы
+// и взаимодействовать с клиентами через браузер.
+#include <WebServer.h>
+   
+// Библиотека для поддержки mDNS (Multicast DNS). Позволяет обращаться к устройству
+// по локальному имени (например, http://esp32.local) вместо IP-адреса.
+#include <ESPmDNS.h>
+
+// Библиотека для выполнения HTTP-запросов (GET, POST и др.). Используется для
+// получения данных с удаленных серверов или отправки информации в облако.
+#include <HTTPClient.h>
+
+// Библиотека для работы с JSON. Позволяет легко разбирать и создавать JSON-структуры,
+// что удобно для обмена данными с веб-сервером или API.
+#include <ArduinoJson.h>
+
+// Подключение стандартной библиотеки C++ для работы с динамическими массивами (векторами).
+// Вектор — это контейнер, который автоматически изменяет свой размер при добавлении/удалении элементов.
+#include <vector>
+
+// Библиотека алгоритмов C++. Содержит функции для сортировки, поиска, обработки данных и других операций.
+#include <algorithm>
+
+// Библиотека для работы с энергонезависимой памятью (EEPROM).
+// Позволяет сохранять данные, которые не исчезнут после перезагрузки устройства.
+#include <EEPROM.h>
+
+// --- Настройки Wi-Fi ---
+const char* WIFI_SSID = "A22";
+const char* WIFI_PASSWORD = "123456780";
+
+// --- Веб-сервер ---
+WebServer server(80);
+const char* HOST_NAME = "esp32";
+
+// --- Параметры лотереи ---
+const int TOTAL_NUMBERS = 24;
+const int NUM_SELECTED_NUMBERS = 12;
+const int HISTORY_SIZE = 6;
+
+// --- Настройки EEPROM ---
+namespace EEPROM_Config {
+    const int FREQUENCY_INFLUENCE_ADDR = 0;
+    const int MIN_SUM_ADDR             = 2;
+    const int MAX_SUM_ADDR             = 4;
+    const int SUM_TOLERANCE_ADDR       = 6;
+    const int DRAWS_TO_ANALYZE_ADDR    = 8;
+    const int MIN_EVEN_ADDR          = 10;
+    const int MAX_EVEN_ADDR          = 12;
+    const int MIN_ODD_ADDR           = 14;
+    const int MAX_ODD_ADDR           = 16;
+    const int BALANCE_EVEN_ODD_ADDR  = 18;
+    const int FREQUENCY_WEIGHT_ADDR  = 20;
+    const int INTERVAL_WEIGHT_ADDR   = 22;
+    const int PAIR_FREQUENCY_INFLUENCE_ADDR = 24; // Адрес для влияния частоты пар
+    const int HOT_COLD_INFLUENCE_ADDR    = 26; // Адрес для влияния горячих/холодных чисел
+    const int HOT_COLD_DRAWS_ADDR       = 28; // Адрес для количества тиражей анализа Г/Х чисел
+    const int EEPROM_SIZE            = 32; // Увеличиваем размер EEPROM (если нужно, можно увеличить еще)
+}
+using namespace EEPROM_Config;
+
+// --- Глобальные переменные ---
+String generatedSequencesHistory[HISTORY_SIZE];
+int generatedNumbersHistory[HISTORY_SIZE][NUM_SELECTED_NUMBERS];
+int historyMatches[HISTORY_SIZE];
+int historyIndex = 0;
+
+String generatedSequenceForWebpage = "";
+String comparisonResultForWebpage = "";
+String historyComparisonResultsForWebpage = "";
+
+int lastGeneratedNumbers[NUM_SELECTED_NUMBERS];
+bool isSequenceGenerated = false;
+
+// --- Настройки параметров генерации ---
+int currentFrequencyInfluence = 50;
+int currentMinSum = 78;
+int currentMaxSum = 222;
+int currentSumTolerancePercent = 2;
+int currentDrawsToAnalyze = 30;
+int currentMinEven = 4;
+int currentMaxEven = 6;
+int currentMinOdd = 4;
+int currentMaxOdd = 6;
+bool currentBalanceEvenOdd = true;
+int currentFrequencyWeightPercent = 70;
+int currentIntervalWeightPercent = 30;
+int currentPairFrequencyInfluence = 50; // Default pair frequency influence to medium (50%)
+int currentHotColdInfluence = 50; // Влияние горячих/холодных чисел по умолчанию (50%)
+int currentHotColdDrawsAnalyzed = 20; // Количество тиражей для анализа Г/Х чисел по умолчанию (20)
+
+bool isHistoryEmpty = true;
+
+String successMessageForWebpage = "";
+String errorMessageForWebpage = "";
+
+bool settingsChanged = false; // Флаг для отслеживания изменений настроек
+
+// --- Структуры данных ---
+struct DrawData {
+    int drawNumber;
+    String numbersLine;
+};
+
+struct SumDistribution {
+    double averageSum;
+    double medianSum;
+    int lowerRangeSum;
+    int upperRangeSum;
+    int countNearTargetSum;
+};
+
+struct EvenOddDistribution {
+    double averageEven;
+    double medianEven;
+    int lowerRangeEven;
+    int upperRangeEven;
+    double averageOdd;
+    double medianOdd;
+    int lowerRangeOdd;
+    int upperRangeOdd;
+    int minEvenCountsInDraws;
+    int maxEvenCountsInDraws;
+    int minOddCountsInDraws;
+    int maxOddCountsInDraws;
+};
+
+struct FrequencyAnalysisData {
+    double weightedFrequency[TOTAL_NUMBERS + 1] = {0};
+    int lastDrawNumber[TOTAL_NUMBERS + 1] = {0};
+    int intervalSinceLastDraw[TOTAL_NUMBERS + 1] = {0};
+    double hotColdScore[TOTAL_NUMBERS + 1] = {0}; // Частотный скор (теперь будет комбинированным)
+    double intervalScore[TOTAL_NUMBERS + 1] = {0}; // **НОВОЕ**: Интервальный скор
+    bool isHot[TOTAL_NUMBERS + 1] = {false};
+    bool isCold[TOTAL_NUMBERS + 1] = {false};
+};
+
+FrequencyAnalysisData frequencyData;
+
+std::vector<DrawData> drawDataVector;
+std::vector<long> drawSumsVector;
+std::vector<int> drawEvenCountsVector;
+std::vector<int> drawOddCountsVector;
+
+// --- НОВАЯ СТРУКТУРА ДЛЯ АНАЛИЗА ПАР ---
+int pairFrequency[TOTAL_NUMBERS + 1][TOTAL_NUMBERS + 1] = {0}; // [номер1][номер2] - частота пары
+
+bool compareDrawData(const DrawData& a, const DrawData& b) {
+    return a.drawNumber < b.drawNumber;
+}
+
+// --- Функции EEPROM ---
+void saveSettingsToEEPROM() {
+    EEPROM.put(FREQUENCY_INFLUENCE_ADDR, currentFrequencyInfluence);
+    EEPROM.put(MIN_SUM_ADDR, currentMinSum);
+    EEPROM.put(MAX_SUM_ADDR, currentMaxSum);
+    EEPROM.put(SUM_TOLERANCE_ADDR, currentSumTolerancePercent);
+    EEPROM.put(DRAWS_TO_ANALYZE_ADDR, currentDrawsToAnalyze);
+    EEPROM.put(MIN_EVEN_ADDR, currentMinEven);
+    EEPROM.put(MAX_EVEN_ADDR, currentMaxEven);
+    EEPROM.put(MIN_ODD_ADDR, currentMinOdd);
+    EEPROM.put(MAX_ODD_ADDR, currentMaxOdd);
+    EEPROM.put(BALANCE_EVEN_ODD_ADDR, currentBalanceEvenOdd);
+    EEPROM.put(FREQUENCY_WEIGHT_ADDR, currentFrequencyWeightPercent);
+    EEPROM.put(INTERVAL_WEIGHT_ADDR, currentIntervalWeightPercent);
+    EEPROM.put(PAIR_FREQUENCY_INFLUENCE_ADDR, currentPairFrequencyInfluence); // Сохраняем влияние частоты пар
+    EEPROM.put(HOT_COLD_INFLUENCE_ADDR, currentHotColdInfluence); // Сохраняем влияние Г/Х чисел
+    EEPROM.put(HOT_COLD_DRAWS_ADDR, currentHotColdDrawsAnalyzed);   // Сохраняем кол-во тиражей для анализа Г/Х
+    EEPROM.commit();
+    Serial.println("Настройки сохранены в EEPROM");
+    settingsChanged = false; // Сбрасываем флаг после сохранения
+}
+
+void loadSettingsFromEEPROM() {
+    EEPROM.get(FREQUENCY_INFLUENCE_ADDR, currentFrequencyInfluence);
+    EEPROM.get(MIN_SUM_ADDR, currentMinSum);
+    EEPROM.get(MAX_SUM_ADDR, currentMaxSum);
+    EEPROM.get(SUM_TOLERANCE_ADDR, currentSumTolerancePercent);
+    EEPROM.get(DRAWS_TO_ANALYZE_ADDR, currentDrawsToAnalyze);
+    EEPROM.get(MIN_EVEN_ADDR, currentMinEven);
+    EEPROM.get(MAX_EVEN_ADDR, currentMaxEven);
+    EEPROM.get(MIN_ODD_ADDR, currentMinOdd);
+    EEPROM.get(MAX_ODD_ADDR, currentMaxOdd);
+    EEPROM.get(BALANCE_EVEN_ODD_ADDR, currentBalanceEvenOdd);
+    EEPROM.get(FREQUENCY_WEIGHT_ADDR, currentFrequencyWeightPercent);
+    EEPROM.get(INTERVAL_WEIGHT_ADDR, currentIntervalWeightPercent);
+    EEPROM.get(PAIR_FREQUENCY_INFLUENCE_ADDR, currentPairFrequencyInfluence); // Загружаем влияние частоты пар
+    EEPROM.get(HOT_COLD_INFLUENCE_ADDR, currentHotColdInfluence); // Загружаем влияние Г/Х чисел
+    EEPROM.get(HOT_COLD_DRAWS_ADDR, currentHotColdDrawsAnalyzed);   // Загружаем кол-во тиражей для анализа Г/Х
+    Serial.println("Настройки загружены из EEPROM");
+    settingsChanged = false; // Сбрасываем флаг при загрузке настроек
+}
+
+// --- Функции для получения и парсинга данных XLotto ---
+bool fetchAndParseXLottoJavascript() {
+    HTTPClient http;
+    String webPageURL = "https://www.xlotto.ru/static/1224";
+
+    http.begin(webPageURL);
+    http.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+        Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+        if (httpCode == HTTP_CODE_OK) {
+            String htmlPayload = http.getString();
+            if (parseXLottoJavascriptData(htmlPayload)) {
+                successMessageForWebpage = "Данные XLotto успешно обновлены.";
+                errorMessageForWebpage = "";
+                return true;
+            } else {
+                errorMessageForWebpage = "Ошибка при парсинге данных XLotto.";
+                successMessageForWebpage = "";
+                return false;
+            }
+        } else {
+            Serial.printf("[HTTP] GET failed, error code: %d\n", httpCode);
+            errorMessageForWebpage = "Ошибка HTTP при обновлении данных: " + String(httpCode);
+            successMessageForWebpage = "";
+            return false;
+        }
+    } else {
+        Serial.printf("[HTTP] GET... failed, connection error: %s\n", http.errorToString(httpCode).c_str());
+        errorMessageForWebpage = "Ошибка подключения при обновлении данных: " + http.errorToString(httpCode);
+        successMessageForWebpage = "";
+        return false;
+    }
+    http.end();
+}
+
+bool parseXLottoJavascriptData(String html) {
+    String jsonData = extractJsonData(html);
+
+    if (jsonData.length() > 0) {
+        Serial.println("JSON Data extracted and parsed.");
+
+        DynamicJsonDocument doc(32768);
+        DeserializationError error = deserializeJson(doc, jsonData);
+
+        if (error) {
+            Serial.print("deserializeJson() failed: ");
+            Serial.println(error.c_str());
+            Serial.print("Error code: "); Serial.println(error.code());
+            return false;
+        }
+
+        JsonArray drawings = doc["drawings"].as<JsonArray>();
+        if (!drawings.isNull()) {
+            drawDataVector.clear();
+            for (JsonObject drawing : drawings) {
+                int drawNumber = drawing["draw"].as<int>();
+                JsonArray numbers = drawing["numbers"].as<JsonArray>();
+                String lineOfNumbers = "";
+                for (int number : numbers) {
+                    lineOfNumbers += String(number) + " ";
+                }
+                drawDataVector.push_back({drawNumber, lineOfNumbers});
+
+                Serial.print("Тираж: ");
+                Serial.print(drawNumber);
+                Serial.print(" | Числа: ");
+                Serial.print(lineOfNumbers);
+                Serial.println();
+            }
+
+            std::sort(drawDataVector.begin(), drawDataVector.end(), compareDrawData);
+            return true;
+
+        } else {
+            Serial.println("Ключ 'drawings' не найден в JSON!");
+            return false;
+        }
+    } else {
+        Serial.println("Не удалось извлечь JSON Data из HTML!");
+        return false;
+    }
+}
+
+String extractJsonData(String html) {
+    int start = html.indexOf("var LotteryData =");
+    if (start == -1) return "";
+    start = html.indexOf("{", start);
+    if (start == -1) return "";
+    int end = html.lastIndexOf("};");
+    if (end == -1) return "";
+    String jsonData = html.substring(start, end + 2);
+    jsonData.trim();
+    jsonData.replace("\n", "");
+    jsonData.replace("\r", "");
+    return jsonData;
+}
+
+int compareSequences(int* generatedSequence, String drawNumbersLine) {
+    int drawNumbers[NUM_SELECTED_NUMBERS];
+    parseNumbers(drawNumbersLine, drawNumbers);
+    int matches = 0;
+    for (int i = 0; i < NUM_SELECTED_NUMBERS; i++) {
+        for (int j = 0; j < NUM_SELECTED_NUMBERS; j++) {
+            if (generatedSequence[i] == drawNumbers[j]) {
+                matches++;
+                break;
+            }
+        }
+    }
+    return matches;
+}
+
+String getPrizeCategory(int matches) {
+    if (matches == 12 || matches == 0) return "Суперприз";
+    if (matches == 11 || matches == 1) return "Выигрыш 20000 руб";
+    if (matches == 10 || matches == 2) return "Выигрыш 2000 руб";
+    if (matches == 9 || matches == 3) return "Выигрыш 400 руб";
+    if (matches == 8 || matches == 4) return "Выйгрыш 100 руб";
+    return "";
+}
+
+// --- Функции для генерации HTML веб-страницы ---
+String generateSettingsSectionHTML() {
+    String html = "<div class='section-card'>";
+    html += "<h2 class='section-title'>Настройки генерации</h2>";
+    html += "<form class='settings-form' method='POST' action='/'>";
+
+    html += "<div class='slider-container'>";
+    html += "<label for='frequencyInfluence'>Влияние частоты (0-100%):</label>";
+    html += "<input type='range' id='frequencyInfluence' name='frequencyInfluence' min='0' max='100' value='" + String(currentFrequencyInfluence) + "' oninput='updateSliderValue(\"frequencyValue\", this.value)'>";
+    html += "<span id='frequencyValue' class='slider-value'>" + String(currentFrequencyInfluence) + "%</span>";
+    html += "</div><br>";
+
+    html += "<div class='slider-container'>";
+    html += "<label for='frequencyWeight'>Вес частоты (0-100%):</label>";
+    html += "<input type='range' id='frequencyWeight' name='frequencyWeight' min='0' max='100' value='" + String(currentFrequencyWeightPercent) + "' oninput='updateSliderValue(\"frequencyWeightValue\", this.value)'>";
+    html += "<span id='frequencyWeightValue' class='slider-value'>" + String(currentFrequencyWeightPercent) + "%</span>";
+    html += "</div><br>";
+
+    html += "<div class='slider-container'>";
+    html += "<label for='intervalWeight'>Вес интервала (0-100%):</label>";
+    html += "<input type='range' id='intervalWeight' name='intervalWeight' min='0' max='100' value='" + String(currentIntervalWeightPercent) + "' oninput='updateSliderValue(\"intervalWeightValue\", this.value)'>";
+    html += "<span id='intervalWeightValue' class='slider-value'>" + String(currentIntervalWeightPercent) + "%</span>";
+    html += "</div><br>";
+
+    // --- НОВЫЙ СЛАЙДЕР ДЛЯ ВЛИЯНИЯ ЧАСТОТЫ ПАР ---
+    html += "<div class='slider-container'>";
+    html += "<label for='pairFrequencyInfluence'>Влияние частоты пар (0-100%):</label>";
+    html += "<input type='range' id='pairFrequencyInfluence' name='pairFrequencyInfluence' min='0' max='100' value='" + String(currentPairFrequencyInfluence) + "' oninput='updateSliderValue(\"pairFrequencyValue\", this.value)'>";
+    html += "<span id='pairFrequencyValue' class='slider-value'>" + String(currentPairFrequencyInfluence) + "%</span>";
+    html += "</div><br>";
+
+    // --- НОВЫЙ СЛАЙДЕР ДЛЯ ВЛИЯНИЯ ГОРЯЧИХ/ХОЛОДНЫХ ЧИСЕЛ ---
+    html += "<div class='slider-container'>";
+    html += "<label for='hotColdInfluence'>Влияние Г/Х чисел (0-100%):</label>";
+    html += "<input type='range' id='hotColdInfluence' name='hotColdInfluence' min='0' max='100' value='" + String(currentHotColdInfluence) + "' oninput='updateSliderValue(\"hotColdInfluenceValue\", this.value)'>";
+    html += "<span id='hotColdInfluenceValue' class='slider-value'>" + String(currentHotColdInfluence) + "%</span>";
+    html += "</div><br>";
+
+    // --- НОВЫЙ СЕЛЕКТОР ДЛЯ КОЛИЧЕСТВА ТИРАЖЕЙ АНАЛИЗА Г/Х ЧИСЕЛ ---
+    html += "<div><label for='hotColdDrawsAnalyzed'>Тиражей для анализа Г/Х:</label>";
+    html += "<select name='hotColdDrawsAnalyzed' id='hotColdDrawsAnalyzed'>";
+    int drawsOptions[] = {10, 20, 30, 50, 100};
+    for (int draws : drawsOptions) {
+        html += String("<option value='") + draws + "'";
+        if (currentHotColdDrawsAnalyzed == draws) html += " selected";
+        html += ">" + String(draws) + "</option>";
+    }
+    html += String("<option value='all'") + (currentHotColdDrawsAnalyzed == 0 ? " selected" : "") + ">Все</option>"; // Опция "Все" тоже может быть полезна
+    html += "</select></div>";
+
+
+    html += "<div><label for='drawsToAnalyze'>Анализировать тиражей:</label>";
+    html += "<select name='drawsToAnalyze' id='drawsToAnalyze'>";
+    for (int i = 1; i <= 100; ++i) {
+        html += String("<option value='") + i + "'";
+        if (currentDrawsToAnalyze == i) html += " selected";
+        html += ">" + String(i) + "</option>";
+    }
+    html += String("<option value='all'") + (currentDrawsToAnalyze == 0 ? " selected" : "") + ">Все</option>";
+    html += "</select></div>";
+
+    html += "<div><label for='minEven'>Мин. четных (1-10):</label>";
+    html += "<input type='number' id='minEven' name='minEven' min='1' max='10' value='" + String(currentMinEven) + "'></div>";
+    html += "<div><label for='maxEven'>Макс. четных (1-10):</label>";
+    html += "<input type='number' id='maxEven' name='maxEven' min='1' max='10' value='" + String(currentMaxEven) + "'></div>";
+    html += "<div><label for='minOdd'>Мин. нечетных (1-10):</label>";
+    html += "<input type='number' id='minOdd' name='minOdd' min='1' max='10' value='" + String(currentMinOdd) + "'></div>";
+    html += "<div><label for='maxOdd'>Макс. нечетных (1-10):</label>";
+    html += "<input type='number' id='maxOdd' name='maxOdd' min='1' max='10' value='" + String(currentMaxOdd) + "'></div>";
+    html += "<div><label for='balanceEvenOdd'>Баланс чет/нечет:</label>";
+    html += "<input type='checkbox' id='balanceEvenOdd' name='balanceEvenOdd' " + String(currentBalanceEvenOdd ? "checked" : "") + "></div>";
+
+    html += "<label></label>";
+    html += "<input type='submit' value='Применить'>";
+    html += "</form>";
+
+    // --- НОВАЯ ФОРМА ДЛЯ КНОПКИ "СОХРАНИТЬ НАСТРОЙКИ" ---
+    html += "<form method='POST' action='/saveSettings'>";
+    html += "<input type='submit' value='Сохранить настройки'>";
+    html += "</form>";
+    html += "</div>";
+    return html;
+}
+
+String generateActionsSectionHTML() {
+    String html = "<div class='section-card'>";
+    html += "<h2 class='section-title'>Действия</h2>";
+    html += "<div class='button-container'>";
+    html += "<form method='POST' action='/submit'>";
+    html += "<input type='submit' value='Сгенерировать числа'> <i class='fa fa-dice-six'></i>";
+    html += "</form>";
+
+    html += "<form id='updateDataForm' method='POST' action='/updateData'>";
+    html += "<input type='submit' value='Обновить данные'> <i class='fa fa-sync-alt'></i>";
+    html += "</form>";
+
+    html += "<form id='resetHistoryForm' method='POST' action='/resetHistory'>";
+    html += "<input type='submit' value='Сбросить историю'> <i class='fa fa-trash-alt'></i>";
+    html += "</form>";
+    html += "<div id='loading'>Загрузка данных...</div>";
+    html += "</div>";
+    html += "</div>";
+    return html;
+}
+
+String generateDrawDataSectionHTML() {
+    String html = "<div class='section-card'>";
+    html += "<h2 class='section-title'>Данные последних тиражей и анализ</h2>";
+    html += "<div class='button-container'>";
+    html += "<button id='toggleDrawDataButton' onclick='toggleDrawData()'><i class='fa fa-eye'></i> Показать тиражи</button>";
+    html += "</div>";
+    html += "<div id='drawDataSection' style='display:none;'>";
+    html += "<pre>";
+    long totalSum = 0;
+    int drawCount = 0;
+
+    for (int i = drawDataVector.size() - 1; i >= 0; i--) {
+        const auto& drawData = drawDataVector[i];
+        long lineSum = sumLine(drawData.numbersLine);
+        int evenCountForDraw = 0;
+        int oddCountForDraw = 0;
+        int numbers[NUM_SELECTED_NUMBERS];
+        int count = parseNumbers(drawData.numbersLine, numbers);
+        for (int j = 0; j < count; j++) {
+            if (numbers[j] % 2 == 0) evenCountForDraw++;
+            else oddCountForDraw++;
+        }
+
+        html += "<div class='draw-card'>";
+        html += "<p><b>Тираж:</b> " + String(drawData.drawNumber) + "</p>";
+        html += "<p><b>Числа:</b> " + drawData.numbersLine + "</p>";
+        html += "<p><b>Сумма:</b> " + String(lineSum) + "</p>";
+        html += "<p><b>Четные:</b> " + String(evenCountForDraw) + ", <b>Нечетные:</b> " + String(oddCountForDraw) + "</p>";
+        html += "</div>";
+        totalSum += lineSum;
+        drawCount++;
+    }
+    html += "</pre>";
+
+    if (drawCount > 0) {
+        double averageSum = (double)totalSum / drawCount;
+        html += "<div id='averageSum'>Среднее значение сумм тиражей: <b>" + String(averageSum, 2) + "</b></div>";
+    } else {
+        html += "<div id='averageSum'>Нет данных для расчета среднего значения.</div>";
+    }
+    html += "</div>";
+
+    SumDistribution sumDistribution = analyzeSumDistribution(currentSumTolerancePercent);
+    EvenOddDistribution evenOddDistribution = analyzeEvenOddDistribution();
+    html += "<div id='sumAnalysis'>";
+    html += "<h3 style='text-align: left; color: #007bff; margin-top: 20px;'>Анализ сумм и чет/нечет тиражей:</h3>";
+    html += "<p>Средняя сумма: <b>" + String(sumDistribution.averageSum, 2) + "</b></p>";
+    html += "<p>Медианная сумма: <b>" + String(sumDistribution.medianSum, 2) + "</b></p>";
+    html += "<p>Вероятный диапазон сумм (25%-75%): <b>" + String(sumDistribution.lowerRangeSum) + " - " + String(sumDistribution.upperRangeSum) + "</b></p>";
+    html += "<p>Тиражей со <b>средней</b> суммой около 150 (<span id='sumToleranceValue'>±" + String(currentSumTolerancePercent) + "</span>%): <b>" + String(sumDistribution.countNearTargetSum) + "</b> из " + String(drawSumsVector.size()) + "</p>";
+
+    html += "<p>Среднее кол-во четных чисел: <b>" + String(evenOddDistribution.averageEven, 2) + "</b></p>";
+    html += "<p>Медианное кол-во четных чисел: <b>" + String(evenOddDistribution.medianEven, 2) + "</b></p>";
+    html += "<p>Вероятный диапазон четных чисел (25%-75%): <b>" + String(evenOddDistribution.lowerRangeEven) + " - " + String(evenOddDistribution.upperRangeEven) + "</b></p>";
+    html += "<p>Мин. кол-во четных чисел в тиражах: <b>" + String(evenOddDistribution.minEvenCountsInDraws) + "</b></p>";
+    html += "<p>Макс. кол-во четных чисел в тиражах: <b>" + String(evenOddDistribution.maxEvenCountsInDraws) + "</b></p>";
+
+    html += "<p>Среднее кол-во нечетных чисел: <b>" + String(evenOddDistribution.averageOdd, 2) + "</b></p>";
+    html += "<p>Медианное кол-во нечетных чисел: <b>" + String(evenOddDistribution.medianOdd, 2) + "</b></p>";
+    html += "<p>Вероятный диапазон нечетных чисел (25%-75%): <b>" + String(evenOddDistribution.lowerRangeOdd) + " - " + String(evenOddDistribution.upperRangeOdd) + "</b></p>";
+    html += "<p>Мин. кол-во нечетных чисел в тиражах: <b>" + String(evenOddDistribution.minOddCountsInDraws) + "</b></p>";
+    html += "<p>Макс. кол-во нечетных чисел в тиражах: <b>" + String(evenOddDistribution.maxOddCountsInDraws) + "</b></p>";
+
+    // --- Секция анализа пар чисел ---
+    html += "<h3 style='text-align: left; color: #007bff; margin-top: 20px;'>Анализ пар чисел:</h3>";
+    html += "<p>Топ 10 часто встречающихся пар чисел:</p>";
+    html += "<pre>";
+    std::vector<std::pair<std::pair<int, int>, int>> sortedPairs;
+    for (int i = 1; i <= TOTAL_NUMBERS; ++i) {
+        for (int j = i + 1; j <= TOTAL_NUMBERS; ++j) { // j = i + 1, чтобы избежать дубликатов и пар вида (x, x)
+            if (pairFrequency[i][j] > 0) {
+                sortedPairs.push_back({{i, j}, pairFrequency[i][j]});
+            }
+        }
+    }
+    std::sort(sortedPairs.begin(), sortedPairs.end(), [](const std::pair<std::pair<int, int>, int>& a, const std::pair<std::pair<int, int>, int>& b) {
+        return b.second < a.second; // Сортировка по убыванию частоты
+    });
+
+    int count = 0;
+    for (const auto& pairData : sortedPairs) {
+        if (count >= 10) break; // Выводим только топ 10 пар
+        html += String(pairData.first.first) + " и " + String(pairData.first.second) + ": " + String(pairData.second) + " раз\n";
+        count++;
+    }
+
+    if (sortedPairs.empty()) {
+        html += "Нет данных для анализа пар чисел.";
+    }
+
+    html += "</pre>";
+    // --- Конец секции анализа пар чисел ---
+
+
+    html += "</div>";
+    html += "</div>";
+    return html;
+}
+
+
+String generateSumRangeSectionHTML() {
+    String html = "<div class='section-card'>";
+    html += "<h2 class='section-title'>Настройка диапазона суммы для генерации</h2>";
+    html += "<form class='settings-form' method='POST' action='/submit'>";
+    html += "<label for='minSum'>Мин. сумма:</label>";
+    html += "<input type='number' id='minSum' name='minSum' value='" + String(currentMinSum) + "'>";
+    html += "<label for='maxSum'>Макс. сумма:</label>";
+    html += "<input type='number' id='maxSum' name='maxSum' value='" + String(currentMaxSum) + "'>";
+    html += "<label for='sumTolerancePercent'>Допуск, % (1-10):</label>";
+    html += "<input type='number' id='sumTolerancePercent' name='sumTolerancePercent' min='1' max='10' value='" + String(currentSumTolerancePercent) + "'>";
+    html += "<input type='submit' value='Сгенерировать с диапазоном'>";
+    html += "</form>";
+    html += "</div>";
+    return html;
+}
+
+String generateComparisonResultSectionHTML() {
+    if (comparisonResultForWebpage.length() == 0) return "";
+    String html = "<div class='section-card'>";
+    html += "<h2 class='section-title'>Результат сравнения с последним тиражом</h2>";
+    html += "<div id='comparisonResult'>" + comparisonResultForWebpage + "</div>";
+    html += "</div>";
+    return html;
+}
+
+String generateHistorySectionHTML() {
+    String html = "<div class='section-card'>";
+    html += "<h2 class='section-title'>История генераций</h2>";
+    html += "<pre>";
+    historyComparisonResultsForWebpage = "";
+    for (int i = 0; i < HISTORY_SIZE; i++) {
+        if (generatedSequencesHistory[i].length() > 0) {
+            int matches = historyMatches[i];
+            String prizeCategory = getPrizeCategory(matches);
+            html += String(i + 1) + ". " + generatedSequencesHistory[i];
+            if (!drawDataVector.empty()) {
+              html += " (Совпадений: " + String(matches) + ")";
+              if (prizeCategory.length() > 0) {
+                html += " - <b>" + prizeCategory + "</b>";
+              }
+              historyComparisonResultsForWebpage += "Последовательность " + String(i + 1) + ": " + String(matches) + " совпадений, Категория: " + prizeCategory + "\n";
+            } else {
+              html += " (Нет данных для сравнения)";
+            }
+            html += "<br>";
+        }
+    }
+    html += "</pre>";
+
+    if (historyComparisonResultsForWebpage.length() > 0) {
+        html += "<div id='historyComparisonResults' style='display:none;'>История сравнений:\n<pre>" + historyComparisonResultsForWebpage + "</pre></div>";
+    }
+    html += "</div>";
+    return html;
+}
+
+String generateLastSequenceSectionHTML() {
+    if (generatedSequenceForWebpage.length() == 0) return "";
+    String html = "<div class='section-card'>";
+    html += "<h2 class='section-title'>Последняя сгенерированная последовательность</h2>";
+    html += "<pre>" + generatedSequenceForWebpage + "</pre>";
+    html += "</div>";
+    return html;
+}
+
+String getWebPage() {
+    String htmlPage = String("<!DOCTYPE HTML>\r\n<html><head><title>ESP32 Лотерея</title><meta charset='utf-8'>");
+    htmlPage += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+    htmlPage += "<link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css\" integrity=\"sha512-9usAa10IRO0HhonpyAIVpjrylPvoDwiPUiKdWk5t3PyolY1cOd4DSE0Ga+ri4AuTroPR5aQvXU9xC6qOPnzFeg==\" crossorigin=\"anonymous\" referrerpolicy=\"no-referrer\" />";
+    htmlPage += "<style>";
+    htmlPage += "body { font-family: 'Roboto', sans-serif; margin: 0; background-color: #f8f8f8; color: #333; }";
+    htmlPage += ".container { width: 90%; max-width: 960px; margin: 20px auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
+    htmlPage += ".section-card { background-color: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 20px; margin-bottom: 20px; border: 1px solid #eee; }";
+    htmlPage += ".section-title { color: #007bff; text-align: left; border-bottom: 2px solid #007bff; padding-bottom: 5px; margin-bottom: 15px; display: inline-block; }";
+    htmlPage += "h1, h2 { color: #007bff; text-align: center; }";
+    htmlPage += "h1 { margin-bottom: 20px; }";
+    htmlPage += "p { text-align: center; color: #555; margin-bottom: 20px; }";
+    htmlPage += "pre { background-color: #f0f0f0; padding: 15px; border: 1px solid #ddd; border-radius: 8px; overflow-x: auto; }";
+    htmlPage += "form { text-align: center; margin-bottom: 15px; display: inline-block; margin-right: 10px; }";
+    htmlPage += "input[type='submit'], select, button, input[type='number'], input[type='checkbox'] { background-color: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 8px; cursor: pointer; font-size: 1em; transition: background-color 0.3s; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; }";
+    htmlPage += "input[type='submit'] i, select i, button i { margin-right: 8px; }";
+    htmlPage += "input[type='submit']:hover, select:hover, button:hover { background-color: #0056b3; box-shadow: 0 2px 6px rgba(0,0,0,0.2); }";
+    htmlPage += "input[type='number'], select { color: #333; background-color: #f0f0f0; padding: 10px; border: 1px solid #ddd; border-radius: 8px; -webkit-appearance: none; -moz-appearance: none; appearance: none; justify-content: center; }";
+    htmlPage += "input[type='checkbox'] { background-color: initial; -webkit-appearance: checkbox; -moz-appearance: checkbox; appearance: checkbox; width: auto; height: auto; padding: 0; margin-right: 5px; border: 1px solid #ddd; box-shadow: none; }";
+    htmlPage += ".settings-form label { color: #555; display: inline-block; margin-right: 5px; margin-bottom: 5px; text-align: left; width: auto; padding: 0;}";
+    htmlPage += ".settings-form div { margin-bottom: 10px; text-align: left; }";
+    htmlPage += "#loading { display: none; color: #007bff; text-align: center; margin-top: 10px; font-weight: bold;}";
+    htmlPage += "#averageSum { text-align: center; font-size: 1.1em; margin-top: 15px; color: #008000; font-weight: bold; }";
+    htmlPage += "#resetHistoryForm { margin-top: 15px; }";
+    htmlPage += "#comparisonResult { text-align: center; margin-top: 15px; font-weight: bold; color: #ff6f61; }";
+    htmlPage += "#historyComparisonResults { text-align: left; margin-top: 10px; font-size: 0.9em; color: #777; }";
+    htmlPage += ".button-container { text-align: center; margin-bottom: 20px; }";
+    htmlPage += ".draw-card { padding: 10px; margin-bottom: 5px; border: 1px solid #ddd; border-radius: 8px; background-color: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.05); font-size: 0.9em; }";
+    htmlPage += ".settings-form { margin-bottom: 20px; }";
+    htmlPage += ".settings-form label, .settings-form select { margin-right: 10px; color: #555; }";
+    htmlPage += "#drawDataSection { display: none; }";
+    htmlPage += "#toggleDrawDataButton { margin-bottom: 10px; }";
+    htmlPage += "#sumAnalysis p { margin: 3px 0; text-align: left; }";
+    htmlPage += ".slider-container { display: flex; align-items: center; justify-content: center; }";
+    htmlPage += ".slider-value { margin-left: 10px; width: 40px; text-align: center; color: #555; }";
+    htmlPage += ".success-message { color: green; text-align: center; margin-top: 10px; font-weight: bold; display: none; }";
+    htmlPage += ".error-message { color: red; text-align: center; margin-top: 10px; font-weight: bold; display: none; }";
+    htmlPage += "</style>";
+    htmlPage += "<link href=\"https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap\" rel=\"stylesheet\">";
+    htmlPage += "</head><body>";
+    htmlPage += "<div class='container'>";
+
+    htmlPage += "<h1>Лотерейки - #Явыиграю</h1>";
+    htmlPage += "<p>Веб-интерфейс для генерации лотерейных последовательностей XLotto.</p>";
+    htmlPage += "<div id='success-message' class='success-message'></div>";
+    htmlPage += "<div id='error-message' class='error-message'></div>";
+
+    htmlPage += generateSettingsSectionHTML();
+    htmlPage += generateActionsSectionHTML();
+    htmlPage += generateDrawDataSectionHTML();
+    htmlPage += generateSumRangeSectionHTML();
+    htmlPage += generateComparisonResultSectionHTML();
+    htmlPage += generateHistorySectionHTML();
+    htmlPage += generateLastSequenceSectionHTML();
+
+    htmlPage += "<script>";
+    htmlPage += "function toggleDrawData() {";
+    htmlPage += "  var section = document.getElementById('drawDataSection');";
+    htmlPage += "  var button = document.getElementById('toggleDrawDataButton');";
+    htmlPage += "  var eyeIcon = button.querySelector('i');";
+
+    htmlPage += "  if (section.style.display === 'none') {";
+    htmlPage += "    section.style.display = 'block';";
+    htmlPage += "    button.textContent = 'Скрыть тиражи ';";
+    htmlPage += "    eyeIcon.className = 'fa fa-eye-slash'; ";
+    htmlPage += "    button.prepend(eyeIcon); ";
+    htmlPage += "  } else {";
+    htmlPage += "    section.style.display = 'none';";
+    htmlPage += "    button.textContent = 'Показать тиражи ';";
+    htmlPage += "    eyeIcon.className = 'fa fa-eye'; ";
+    htmlPage += "    button.prepend(eyeIcon); ";
+    htmlPage += "  }";
+    htmlPage += "}";
+
+    htmlPage += "function updateSliderValue(elementId, val) {";
+    htmlPage += "  document.getElementById(elementId).textContent = val + '%';";
+    htmlPage += "}";
+
+    htmlPage += "function displayMessages() {";
+    htmlPage += "  var successMessage = '" + successMessageForWebpage + "';";
+    htmlPage += "  var errorMessage = '" + errorMessageForWebpage + "';";
+    htmlPage += "  var successDiv = document.getElementById('success-message');";
+    htmlPage += "  var errorDiv = document.getElementById('error-message');";
+
+    htmlPage += "  if (successMessage) {";
+        htmlPage += "    successDiv.textContent = successMessage;";
+        htmlPage += "    successDiv.style.display = 'block';";
+    htmlPage += "  } else {";
+        htmlPage += "    successDiv.style.display = 'none';";
+    htmlPage += "  }";
+
+    htmlPage += "  if (errorMessage) {";
+        htmlPage += "    errorDiv.textContent = errorMessage;";
+        htmlPage += "    errorDiv.style.display = 'block';";
+    htmlPage += "  } else {";
+        htmlPage += "    errorDiv.style.display = 'none';";
+    htmlPage += "  }";
+    htmlPage += "}";
+
+
+    htmlPage += "document.getElementById('updateDataForm').addEventListener('submit', function(event) {";
+        htmlPage += "  event.preventDefault();";
+        htmlPage += "  document.getElementById('loading').style.display = 'block';";
+        htmlPage += "  fetch('/updateData', { method: 'POST' })";
+        htmlPage += "    .then(response => response.text())";
+        htmlPage += "    .then(html => {";
+        htmlPage += "      document.getElementById('loading').style.display = 'none';";
+        htmlPage += "      document.body.innerHTML = html;";
+        htmlPage += "      displayMessages();";
+        htmlPage += "    });";
+    htmlPage += "});";
+
+    htmlPage += "document.addEventListener('DOMContentLoaded', function() {";
+        htmlPage += "  displayMessages();";
+    htmlPage += "});";
+
+    htmlPage += "</script>";
+
+    htmlPage += "</div>";
+    htmlPage += "</body></html>\r\n";
+    return htmlPage;
+}
+
+// --- Обработчики веб-сервера ---
+void handleRoot() {
+    processSettingsFromRequest();
+    server.sendHeader("Content-Type", "text/html; charset=utf-8");
+    server.send(200, "text/html", getWebPage());
+}
+
+void processSettingsFromRequest() {
+    String frequencyInfluenceStr = server.arg("frequencyInfluence");
+    if (frequencyInfluenceStr.length() > 0) {
+        int newFrequencyInfluence = constrain(frequencyInfluenceStr.toInt(), 0, 100);
+        if (currentFrequencyInfluence != newFrequencyInfluence) {
+            currentFrequencyInfluence = newFrequencyInfluence;
+            Serial.printf("Настройка влияния частоты выбрана: %d%%\n", currentFrequencyInfluence);
+            settingsChanged = true; // Устанавливаем флаг, что настройки изменены
+        }
+    }
+
+    String frequencyWeightStr = server.arg("frequencyWeight");
+    if (frequencyWeightStr.length() > 0) {
+        int newFrequencyWeightPercent = constrain(frequencyWeightStr.toInt(), 0, 100);
+        if (currentFrequencyWeightPercent != newFrequencyWeightPercent) {
+            currentFrequencyWeightPercent = newFrequencyWeightPercent;
+            Serial.printf("Вес частоты выбран: %d%%\n", currentFrequencyWeightPercent);
+            settingsChanged = true;
+        }
+    }
+
+    String intervalWeightStr = server.arg("intervalWeight");
+    if (intervalWeightStr.length() > 0) {
+        int newIntervalWeightPercent = constrain(intervalWeightStr.toInt(), 0, 100);
+        if (currentIntervalWeightPercent != newIntervalWeightPercent) {
+            currentIntervalWeightPercent = newIntervalWeightPercent;
+            Serial.printf("Вес интервала выбран: %d%%\n", currentIntervalWeightPercent);
+            settingsChanged = true;
+        }
+    }
+
+    // --- НОВАЯ НАСТРОЙКА - ВЛИЯНИЕ ЧАСТОТЫ ПАР ---
+    String pairFrequencyInfluenceStr = server.arg("pairFrequencyInfluence");
+    if (pairFrequencyInfluenceStr.length() > 0) {
+        int newPairFrequencyInfluence = constrain(pairFrequencyInfluenceStr.toInt(), 0, 100);
+        if (currentPairFrequencyInfluence != newPairFrequencyInfluence) {
+            currentPairFrequencyInfluence = newPairFrequencyInfluence;
+            Serial.printf("Влияние частоты пар выбрано: %d%%\n", currentPairFrequencyInfluence);
+            settingsChanged = true;
+        }
+    }
+
+    // --- ОБРАБОТКА ВЛИЯНИЯ ГОРЯЧИХ/ХОЛОДНЫХ ЧИСЕЛ ---
+    String hotColdInfluenceStr = server.arg("hotColdInfluence");
+    if (hotColdInfluenceStr.length() > 0) {
+        int newHotColdInfluence = constrain(hotColdInfluenceStr.toInt(), 0, 100);
+        if (currentHotColdInfluence != newHotColdInfluence) {
+            currentHotColdInfluence = newHotColdInfluence;
+            Serial.printf("Влияние Г/Х чисел выбрано: %d%%\n", currentHotColdInfluence);
+            settingsChanged = true;
+        }
+    }
+
+    // --- ОБРАБОТКА КОЛИЧЕСТВА ТИРАЖЕЙ ДЛЯ АНАЛИЗА Г/Х ЧИСЕЛ ---
+    String hotColdDrawsAnalyzedStr = server.arg("hotColdDrawsAnalyzed");
+    if (hotColdDrawsAnalyzedStr.length() > 0) {
+        int newHotColdDrawsAnalyzed;
+        if (hotColdDrawsAnalyzedStr == "all") {
+            newHotColdDrawsAnalyzed = 0; // "Все" тиражи
+        } else {
+            newHotColdDrawsAnalyzed = constrain(hotColdDrawsAnalyzedStr.toInt(), 1, 1000); // Ограничение до 1000 для разумности
+        }
+        if (currentHotColdDrawsAnalyzed != newHotColdDrawsAnalyzed) {
+            currentHotColdDrawsAnalyzed = newHotColdDrawsAnalyzed;
+            Serial.printf("Анализировать Г/Х чисел: %s\n", (currentHotColdDrawsAnalyzed == 0) ? "Все тиражи" : String(currentHotColdDrawsAnalyzed).c_str());
+            settingsChanged = true;
+        }
+    }
+
+
+    String drawsToAnalyzeStr = server.arg("drawsToAnalyze");
+    if (drawsToAnalyzeStr.length() > 0) {
+        int newDrawsToAnalyze;
+        if (drawsToAnalyzeStr == "all") {
+            newDrawsToAnalyze = 0;
+        } else {
+            newDrawsToAnalyze = constrain(drawsToAnalyzeStr.toInt(), 0, 1000);
+        }
+        if (currentDrawsToAnalyze != newDrawsToAnalyze) {
+            currentDrawsToAnalyze = newDrawsToAnalyze;
+            Serial.printf("Анализировать тиражей: %s\n", (currentDrawsToAnalyze == 0) ? "Все" : String(currentDrawsToAnalyze).c_str());
+            settingsChanged = true;
+        }
+    }
+
+    String minEvenStr = server.arg("minEven");
+    String maxEvenStr = server.arg("maxEven");
+    String minOddStr = server.arg("minOdd");
+    String maxOddStr = server.arg("maxOdd");
+    String balanceEvenOddStr = server.arg("balanceEvenOdd");
+
+    if (minEvenStr.length() > 0) {
+        int newMinEven = constrain(minEvenStr.toInt(), 1, 10);
+        if (currentMinEven != newMinEven) {
+            currentMinEven = newMinEven;
+            Serial.printf("Мин. четных выбрано: %d\n", currentMinEven);
+            settingsChanged = true;
+        }
+    }
+    if (maxEvenStr.length() > 0) {
+        int newMaxEven = constrain(maxEvenStr.toInt(), 1, 10);
+        if (currentMaxEven != newMaxEven) {
+            currentMaxEven = newMaxEven;
+            Serial.printf("Макс. четных выбрано: %d\n", currentMaxEven);
+            settingsChanged = true;
+        }
+    }
+    if (minOddStr.length() > 0) {
+        int newMinOdd = constrain(minOddStr.toInt(), 1, 10);
+        if (currentMinOdd != newMinOdd) {
+            currentMinOdd = newMinOdd;
+            Serial.printf("Мин. нечетных выбрано: %d\n", currentMinOdd);
+            settingsChanged = true;
+        }
+    }
+    if (maxOddStr.length() > 0) {
+        int newMaxOdd = constrain(maxOddStr.toInt(), 1, 10);
+        if (currentMaxOdd != newMaxOdd) {
+            currentMaxOdd = newMaxOdd;
+            Serial.printf("Макс. нечетных выбрано: %d\n", currentMaxOdd);
+            settingsChanged = true;
+        }
+    }
+    if (balanceEvenOddStr.length() > 0) {
+        bool newBalanceEvenOdd = (balanceEvenOddStr == "on");
+        if (currentBalanceEvenOdd != newBalanceEvenOdd) {
+            currentBalanceEvenOdd = newBalanceEvenOdd;
+            Serial.printf("Баланс чет/нечет: %s\n", currentBalanceEvenOdd ? "включен" : "выключен");
+            settingsChanged = true;
+        }
+    }
+}
+
+void handleSaveSettings() {
+    Serial.println("Запрос на сохранение настроек в EEPROM через веб-интерфейс.");
+    saveSettingsToEEPROM(); // Сохраняем настройки в EEPROM
+    successMessageForWebpage = "Настройки сохранены в EEPROM.";
+    errorMessageForWebpage = "";
+    String responseHTML = getWebPage();
+    server.send(200, "text/html", responseHTML);
+}
+
+
+void handleSubmit() {
+    generatedSequenceForWebpage = "";
+    comparisonResultForWebpage = "";
+    successMessageForWebpage = "Последовательность успешно сгенерирована.";
+    errorMessageForWebpage = "";
+
+    processSumRangeSettingsFromRequest();
+
+    analyzeInputBuffer();
+    analyzePairFrequencies();
+    analyzeHotColdNumbers(); // <---  Вызываем функцию анализа горячих/холодных чисел перед генерацией
+
+    if (isHistoryEmpty) {
+        Serial.println("Заполнение истории генераций...");
+        generateInitialHistory();
+    } else {
+        generateSingleSequence();
+    }
+
+    String responseHTML = getWebPage();
+    server.send(200, "text/html", responseHTML);
+}
+
+void processSumRangeSettingsFromRequest() {
+    String minSumStr = server.arg("minSum");
+    String maxSumStr = server.arg("maxSum");
+    String sumTolerancePercentStr = server.arg("sumTolerancePercent");
+
+    if (minSumStr.length() > 0) {
+        int newMinSum = constrain(minSumStr.toInt(), 0, 300);
+        if (currentMinSum != newMinSum) {
+            currentMinSum = newMinSum;
+            Serial.printf("Мин. сумма выбрана: %d\n", currentMinSum);
+            settingsChanged = true;
+        }
+    }
+    if (maxSumStr.length() > 0) {
+        int newMaxSum = constrain(maxSumStr.toInt(), 0, 300);
+        if (currentMaxSum != newMaxSum) {
+            currentMaxSum = newMaxSum;
+            Serial.printf("Макс. сумма выбрана: %d\n", currentMaxSum);
+            settingsChanged = true;
+        }
+    }
+    if (sumTolerancePercentStr.length() > 0) {
+        int newSumTolerancePercent = constrain(sumTolerancePercentStr.toInt(), 1, 10);
+        if (currentSumTolerancePercent != newSumTolerancePercent) {
+            currentSumTolerancePercent = newSumTolerancePercent;
+            Serial.printf("Процент допуска для суммы выбран: %d%%\n", currentSumTolerancePercent);
+            settingsChanged = true;
+        }
+    }
+}
+
+void generateInitialHistory() {
+    for (int i = 0; i < HISTORY_SIZE; ++i) {
+        String sequenceStr;
+        int selectedNumbers[NUM_SELECTED_NUMBERS];
+
+        generateAndGetSequence(selectedNumbers, sequenceStr, currentMinSum, currentMaxSum, currentSumTolerancePercent, currentMinEven, currentMaxEven, currentMinOdd, currentMaxOdd, currentBalanceEvenOdd);
+        generatedSequenceForWebpage = sequenceStr;
+        for (int j = 0; j < NUM_SELECTED_NUMBERS; j++) {
+            lastGeneratedNumbers[j] = selectedNumbers[j];
+        }
+        isSequenceGenerated = true;
+
+        generatedSequencesHistory[historyIndex] = generatedSequenceForWebpage;
+        for (int j = 0; j < NUM_SELECTED_NUMBERS; j++) {
+            generatedNumbersHistory[historyIndex][j] = lastGeneratedNumbers[j];
+        }
+        historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+        generatedSequenceForWebpage = "";
+        delay(50);
+    }
+    isHistoryEmpty = false;
+    Serial.println("История генераций заполнена.");
+}
+
+void generateSingleSequence() {
+    String sequenceStr;
+    int selectedNumbers[NUM_SELECTED_NUMBERS];
+
+    generateAndGetSequence(selectedNumbers, sequenceStr, currentMinSum, currentMaxSum, currentSumTolerancePercent, currentMinEven, currentMaxEven, currentMinOdd, currentMaxOdd, currentBalanceEvenOdd);
+    generatedSequenceForWebpage = sequenceStr;
+    for (int i = 0; i < NUM_SELECTED_NUMBERS; i++) {
+        lastGeneratedNumbers[i] = selectedNumbers[i];
+    }
+    isSequenceGenerated = true;
+
+    generatedSequencesHistory[historyIndex] = generatedSequenceForWebpage;
+    for (int i = 0; i < NUM_SELECTED_NUMBERS; i++) {
+        generatedNumbersHistory[historyIndex][i] = lastGeneratedNumbers[i];
+    }
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+
+    Serial.println("Запущена генерация последовательности через веб-интерфейс.");
+    Serial.println("Сгенерированная последовательность: " + generatedSequenceForWebpage);
+}
+
+
+void handleResetHistory() {
+    Serial.println("Запрос на сброс истории генераций через веб-интерфейс.");
+    resetGenerationHistory();
+
+    successMessageForWebpage = "История генераций успешно сброшена.";
+    errorMessageForWebpage = "";
+
+    String responseHTML = getWebPage();
+    server.send(200, "text/html", responseHTML);
+}
+
+void resetGenerationHistory() {
+    for (int i = 0; i < HISTORY_SIZE; i++) {
+        generatedSequencesHistory[i] = "";
+        for(int j=0; j<NUM_SELECTED_NUMBERS; ++j) {
+            generatedNumbersHistory[i][j] = 0;
+        }
+        historyMatches[i] = 0;
+    }
+    historyIndex = 0;
+    generatedSequenceForWebpage = "";
+    comparisonResultForWebpage = "";
+    isSequenceGenerated = false;
+    historyComparisonResultsForWebpage = "";
+    isHistoryEmpty = true;
+}
+
+
+void handleUpdateData() {
+    Serial.println("Запрос на обновление данных с сайта через веб-интерфейс.");
+    comparisonResultForWebpage = "";
+
+    if (fetchAndParseXLottoJavascript()) {
+        historyComparisonResultsForWebpage = "";
+        analyzeInputBuffer();
+        analyzePairFrequencies();
+        analyzeHotColdNumbers(); // <--- Вызываем функцию анализа горячих/холодных чисел после обновления данных
+        SumDistribution sumDistribution = analyzeSumDistribution(currentSumTolerancePercent);
+        EvenOddDistribution evenOddDistribution = analyzeEvenOddDistribution();
+
+        if (!drawDataVector.empty()) {
+            updateHistoryComparisonResults();
+            if (isSequenceGenerated) {
+                updateLastSequenceComparisonResult();
+            }
+        } else {
+            comparisonResultForWebpage = "Нет данных о тиражах для сравнения.";
+            Serial.println(comparisonResultForWebpage);
+        }
+    } else {
+        Serial.println("Ошибка при обновлении данных. Сообщение об ошибке уже установлено.");
+    }
+
+    String responseHTML = getWebPage();
+    server.send(200, "text/html", responseHTML);
+}
+
+void updateHistoryComparisonResults() {
+    Serial.println("--- Результаты сравнения истории с последним тиражом: ---");
+    for (int i = 0; i < HISTORY_SIZE; i++) {
+        if (generatedSequencesHistory[i].length() > 0) {
+            int matches = compareSequences(generatedNumbersHistory[i], drawDataVector[0].numbersLine);
+            historyMatches[i] = matches;
+            String prizeCategory = getPrizeCategory(matches);
+            historyComparisonResultsForWebpage += "Последовательность " + String(i + 1) + ": " + String(matches) + " совпадений, Категория: " + prizeCategory + "\n";
+            Serial.printf("История %d: Совпадений с последним тиражом: %d из %d, Категория: %s\n", i + 1, matches, NUM_SELECTED_NUMBERS, prizeCategory.c_str());
+        } else {
+            historyMatches[i] = 0;
+        }
+    }
+}
+
+void updateLastSequenceComparisonResult() {
+    int matches = compareSequences(lastGeneratedNumbers, drawDataVector[0].numbersLine);
+    comparisonResultForWebpage = "Совпадений с последним тиражом (после обновления): " + String(matches) + " из " + String(NUM_SELECTED_NUMBERS);
+    Serial.println("Результат сравнения последней: " + comparisonResultForWebpage);
+}
+
+
+void setup() {
+    Serial.begin(9600);
+    Serial.println("Starting ESP32 Web Server");
+
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        Serial.print("Status: ");
+        Serial.println(WiFi.status());
+    }
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+    if (!fetchAndParseXLottoJavascript()) {
+        Serial.println("Ошибка при первоначальном получении данных XLotto. Веб-страница будет загружена с сообщением об ошибке.");
+    }
+    analyzeInputBuffer();
+    analyzePairFrequencies();
+    analyzeHotColdNumbers(); // <--- Вызываем функцию анализа горячих/холодных чисел при старте
+    SumDistribution sumDistribution = analyzeSumDistribution(currentSumTolerancePercent);
+    EvenOddDistribution evenOddDistribution = analyzeEvenOddDistribution();
+
+    if (!MDNS.begin(HOST_NAME)) {
+        Serial.println("Error setting up MDNS responder!");
+        while (1) delay(1000);
+    }
+    Serial.println("mDNS responder started");
+    Serial.printf("Use this URL to access: http://%s.local/\n", HOST_NAME);
+
+    server.on("/", handleRoot);
+    server.on("/submit", HTTP_POST, handleSubmit);
+    server.on("/updateData", HTTP_POST, handleUpdateData);
+    server.on("/resetHistory", HTTP_POST, handleResetHistory);
+    server.on("/saveSettings", HTTP_POST, handleSaveSettings); // Обработчик для сохранения настроек
+    server.on("/", HTTP_POST, handleRoot);
+
+    if (!EEPROM.begin(EEPROM_SIZE)) { // Используем увеличенный размер EEPROM
+        Serial.println("EEPROM initialization failed!");
+    } else {
+        Serial.println("EEPROM initialized");
+    }
+
+    loadSettingsFromEEPROM();
+
+    server.begin();
+    Serial.println("Web server started");
+
+    randomSeed(esp_random());
+
+    resetGenerationHistory();
+    drawDataVector.clear();
+    drawSumsVector.clear();
+    drawEvenCountsVector.clear();
+    drawOddCountsVector.clear();
+    isHistoryEmpty = true;
+    successMessageForWebpage = "";
+    errorMessageForWebpage = "";
+}
+
+void loop() {
+    server.handleClient();
+}
+
+// --- Функции обработки чисел ---
+void analyzeInputBuffer() {
+    drawSumsVector.clear();
+    drawEvenCountsVector.clear();
+    drawOddCountsVector.clear();
+
+    memset(frequencyData.weightedFrequency, 0, sizeof(frequencyData.weightedFrequency));
+    memset(frequencyData.lastDrawNumber, 0, sizeof(frequencyData.lastDrawNumber));
+    memset(frequencyData.intervalSinceLastDraw, 0, sizeof(frequencyData.intervalSinceLastDraw));
+    memset(frequencyData.hotColdScore, 0, sizeof(frequencyData.hotColdScore)); // Обнуляем hotColdScore
+    memset(frequencyData.intervalScore, 0, sizeof(frequencyData.intervalScore)); // **НОВОЕ**: Обнуляем интервальные скоры
+    memset(frequencyData.isHot, 0, sizeof(frequencyData.isHot));         // Обнуляем isHot
+    memset(frequencyData.isCold, 0, sizeof(frequencyData.isCold));        // Обнуляем isCold
+
+
+    int drawsCount = drawDataVector.size();
+    int startDrawIndex = 0;
+
+    if (currentDrawsToAnalyze > 0 && drawsCount > currentDrawsToAnalyze) {
+        startDrawIndex = drawsCount - currentDrawsToAnalyze;
+    }
+
+    double weightDecrement = 1.0 / (currentDrawsToAnalyze > 0 ? currentDrawsToAnalyze : drawsCount);
+    double currentWeight = 1.0;
+    int currentDrawIndex = drawsCount;
+
+    for (int i = startDrawIndex; i < drawsCount; i++) {
+        const auto& drawData = drawDataVector[i];
+        int numbers[NUM_SELECTED_NUMBERS];
+        int count = parseNumbers(drawData.numbersLine, numbers);
+        long currentLineSum = 0;
+        int evenCountForDraw = 0;
+        int oddCountForDraw = 0;
+
+        for (int j = 0; j < count; j++) {
+            int number = numbers[j];
+            if (number >= 1 && number <= TOTAL_NUMBERS) {
+                frequencyData.weightedFrequency[number] += currentWeight;
+                frequencyData.lastDrawNumber[number] = drawData.drawNumber;
+                frequencyData.intervalSinceLastDraw[number] = 0;
+                currentLineSum += number;
+                if (number % 2 == 0) evenCountForDraw++;
+                else oddCountForDraw++;
+            }
+        }
+        drawSumsVector.push_back(currentLineSum);
+        drawEvenCountsVector.push_back(evenCountForDraw);
+        drawOddCountsVector.push_back(oddCountForDraw);
+
+        currentWeight -= weightDecrement;
+        if (currentWeight < 0.1) currentWeight = 0.1;
+        currentDrawIndex--;
+    }
+
+    int lastAnalyzedDrawNumber = (drawDataVector.empty()) ? 0 : drawDataVector.back().drawNumber;
+    for (int i = 1; i <= TOTAL_NUMBERS; ++i) {
+        if (frequencyData.lastDrawNumber[i] == 0 && !drawDataVector.empty()) {
+            frequencyData.intervalSinceLastDraw[i] = currentDrawsToAnalyze;
+        } else if (frequencyData.lastDrawNumber[i] > 0) {
+             frequencyData.intervalSinceLastDraw[i] = lastAnalyzedDrawNumber - frequencyData.lastDrawNumber[i];
+        }
+    }
+}
+
+// --- ФУНКЦИЯ АНАЛИЗА ГОРЯЧИХ/ХОЛОДНЫХ ЧИСЕЛ ---
+void analyzeHotColdNumbers() {
+    memset(frequencyData.hotColdScore, 0, sizeof(frequencyData.hotColdScore));
+    memset(frequencyData.intervalScore, 0, sizeof(frequencyData.intervalScore)); // **НОВОЕ**: Обнуляем интервальные скоры
+    memset(frequencyData.isHot, false, sizeof(frequencyData.isHot));
+    memset(frequencyData.isCold, false, sizeof(frequencyData.isCold));
+
+    int drawsToAnalyze = currentHotColdDrawsAnalyzed;
+    if (drawsToAnalyze <= 0 || drawsToAnalyze > drawDataVector.size()) {
+        drawsToAnalyze = drawDataVector.size();
+    }
+    if (drawsToAnalyze == 0) return;
+
+    int startDrawIndex = drawDataVector.size() - drawsToAnalyze;
+    if (startDrawIndex < 0) startDrawIndex = 0;
+
+    std::vector<int> numberCounts(TOTAL_NUMBERS + 1, 0);
+
+    for (int i = startDrawIndex; i < drawDataVector.size(); ++i) {
+        const auto& drawData = drawDataVector[i];
+        int numbers[NUM_SELECTED_NUMBERS];
+        int count = parseNumbers(drawData.numbersLine, numbers);
+        for (int j = 0; j < count; ++j) {
+            if (numbers[j] >= 1 && numbers[j] <= TOTAL_NUMBERS) {
+                numberCounts[numbers[j]]++;
+            }
+        }
+    }
+
+    double averageFrequency = 0;
+    int validNumbersCount = 0;
+    for (int i = 1; i <= TOTAL_NUMBERS; ++i) {
+        if (numberCounts[i] > 0) {
+            averageFrequency += numberCounts[i];
+            validNumbersCount++;
+        }
+    }
+    if (validNumbersCount > 0) {
+        averageFrequency /= validNumbersCount;
+    } else {
+        averageFrequency = 0;
+    }
+
+    double hotFrequencyThreshold = averageFrequency * 1.15;
+    double coldFrequencyThreshold = averageFrequency * 0.85;
+
+    Serial.print("Средняя частота: "); Serial.println(averageFrequency);
+    Serial.print("Горячий порог (частота): "); Serial.println(hotFrequencyThreshold);
+    Serial.print("Холодный порог (частота): "); Serial.println(coldFrequencyThreshold);
+
+    // --- НОВЫЙ БЛОК: Анализ и скоринг по интервалу ---
+    double averageInterval = 0;
+    int validIntervalsCount = 0;
+    for (int i = 1; i <= TOTAL_NUMBERS; ++i) {
+        if (frequencyData.intervalSinceLastDraw[i] > 0) { // Учитываем только числа, которые выпадали и есть интервал
+            averageInterval += frequencyData.intervalSinceLastDraw[i];
+            validIntervalsCount++;
+        } else if (drawDataVector.size() > 0 && frequencyData.intervalSinceLastDraw[i] == 0) { // Случай когда выпало в последнем тираже
+            averageInterval += 1; // Приближение для последнего тиража, чтобы избежать деления на ноль в среднем
+            validIntervalsCount++;
+        } else if (drawDataVector.size() == 0) {
+             averageInterval += currentDrawsToAnalyze; // Если нет данных, считаем интервал большим
+             validIntervalsCount++;
+        }
+    }
+
+    if (validIntervalsCount > 0) {
+        averageInterval /= validIntervalsCount;
+    } else {
+        averageInterval = currentDrawsToAnalyze; // Если нет данных, ставим большой средний интервал
+    }
+
+    double hotIntervalThreshold = averageInterval * 0.7; // "Горячий" интервал (недавнее выпадение) - меньше среднего на 30%
+    double coldIntervalThreshold = averageInterval * 1.3; // "Холодный" интервал (давнее выпадение) - больше среднего на 30%
+
+    Serial.print("Средний интервал: "); Serial.println(averageInterval);
+    Serial.print("Горячий порог (интервал): "); Serial.println(hotIntervalThreshold);
+    Serial.print("Холодный порог (интервал): "); Serial.println(coldIntervalThreshold);
+
+    for (int i = 1; i <= TOTAL_NUMBERS; ++i) {
+        double frequencyScore = numberCounts[i];
+        double normalizedIntervalScore = 0;
+
+        if (frequencyData.intervalSinceLastDraw[i] > 0) {
+           normalizedIntervalScore =  (double)currentDrawsToAnalyze / frequencyData.intervalSinceLastDraw[i]; // Чем меньше интервал, тем выше скор
+        } else if (drawDataVector.size() > 0 && frequencyData.intervalSinceLastDraw[i] == 0) {
+           normalizedIntervalScore = currentDrawsToAnalyze; // Если в последнем тираже, ставим высокий скор
+        } else {
+           normalizedIntervalScore = 1; // Базовый скор, если нет данных
+        }
+
+
+        // --- Комбинированный скор: Пример - среднее арифметическое (можно настроить веса) ---
+        frequencyData.hotColdScore[i] = (frequencyScore + normalizedIntervalScore) / 2.0; // Простое усреднение
+        frequencyData.intervalScore[i] = normalizedIntervalScore; // Сохраняем интервальный скор для отладки/визуализации
+
+        Serial.printf("Число %d - Частота: %d, Интервал: %d, Комб. скор: %.2f", i, numberCounts[i], frequencyData.intervalSinceLastDraw[i], frequencyData.hotColdScore[i]);
+
+
+        if (frequencyScore > hotFrequencyThreshold || frequencyData.intervalSinceLastDraw[i] < hotIntervalThreshold) { // **ИЛИ** условие
+            frequencyData.isHot[i] = true;
+            Serial.print(" - ГОРЯЧЕЕ (по частоте или интервалу)");
+        } else if (frequencyScore < coldFrequencyThreshold && frequencyData.intervalSinceLastDraw[i] > coldIntervalThreshold) { // **И** условие
+            frequencyData.isCold[i] = true;
+            Serial.print(" - ХОЛОДНОЕ (по частоте и интервалу)");
+        } else {
+            Serial.print(" - НЕ ГОРЯЧЕЕ и НЕ ХОЛОДНОЕ");
+        }
+        Serial.println();
+    }
+    Serial.println("Анализ горячих и холодных чисел (с интервалом) завершен.");
+}
+
+
+// --- ФУНКЦИЯ АНАЛИЗА ЧАСТОТЫ ПАР (БЕЗ ИЗМЕНЕНИЙ) ---
+void analyzePairFrequencies() {
+    memset(pairFrequency, 0, sizeof(pairFrequency));
+
+    int drawsCount = drawDataVector.size();
+    int startDrawIndex = 0;
+
+    if (currentDrawsToAnalyze > 0 && drawsCount > currentDrawsToAnalyze) {
+        startDrawIndex = drawsCount - currentDrawsToAnalyze;
+    }
+
+    for (int i = startDrawIndex; i < drawsCount; i++) {
+        const auto& drawData = drawDataVector[i];
+        int numbers[NUM_SELECTED_NUMBERS];
+        int count = parseNumbers(drawData.numbersLine, numbers);
+
+        for (int j = 0; j < count; ++j) {
+            for (int k = j + 1; k < count; ++k) {
+                int num1 = numbers[j];
+                int num2 = numbers[k];
+                if (num1 > 0 && num1 <= TOTAL_NUMBERS && num2 > 0 && num2 <= TOTAL_NUMBERS) {
+                    pairFrequency[min(num1, num2)][max(num1, num2)]++;
+                }
+            }
+        }
+    }
+    Serial.println("Анализ частоты пар чисел завершен.");
+}
+
+
+int parseNumbers(String input, int *numbers) {
+    int count = 0;
+    char *token = strtok((char *)input.c_str(), " ,;.");
+    while (token != NULL && count < NUM_SELECTED_NUMBERS) {
+        numbers[count++] = atoi(token);
+        token = strtok(NULL, " ,;.");
+    }
+    return count;
+}
+
+SumDistribution analyzeSumDistribution(int sumTolerancePercent) {
+    SumDistribution distribution;
+    if (drawSumsVector.empty()) {
+        return distribution;
+    }
+    long totalSumOfSums = 0;
+    for (long sum : drawSumsVector) totalSumOfSums += sum;
+    distribution.averageSum = (double)totalSumOfSums / drawSumsVector.size();
+
+    std::vector<long> sortedSums = drawSumsVector;
+    std::sort(sortedSums.begin(), sortedSums.end());
+    int medianIndex = sortedSums.size() / 2;
+    distribution.medianSum = (sortedSums.size() % 2 == 0) ? (double)(sortedSums[medianIndex - 1] + sortedSums[medianIndex]) / 2.0 : sortedSums[medianIndex];
+
+    int q1Index = sortedSums.size() * 0.25;
+    int q3Index = sortedSums.size() * 0.75;
+    distribution.lowerRangeSum = sortedSums[q1Index];
+    distribution.upperRangeSum = sortedSums[q3Index];
+
+    int targetSum = 150;
+    int tolerance = (targetSum * sumTolerancePercent) / 100;
+    int count = 0;
+    for (long sum : drawSumsVector) {
+        if ((sum >= (targetSum - tolerance) && sum <= (targetSum + tolerance))) {
+            count++;
+        }
+    }
+    distribution.countNearTargetSum = count;
+
+    return distribution;
+}
+
+EvenOddDistribution analyzeEvenOddDistribution() {
+    EvenOddDistribution distribution;
+    if (drawEvenCountsVector.empty() || drawOddCountsVector.empty()) {
+        return distribution;
+    }
+
+    distribution.minEvenCountsInDraws = 13;
+    distribution.maxEvenCountsInDraws = -1;
+    distribution.minOddCountsInDraws = 13;
+    distribution.maxOddCountsInDraws = -1;
+
+
+    double totalEvenCount = 0;
+    for (int count : drawEvenCountsVector) {
+        totalEvenCount += count;
+        if (count < distribution.minEvenCountsInDraws) distribution.minEvenCountsInDraws = count;
+        if (count > distribution.maxEvenCountsInDraws) distribution.maxEvenCountsInDraws = count;
+    }
+    distribution.averageEven = totalEvenCount / drawEvenCountsVector.size();
+
+    std::vector<int> sortedEvenCounts = drawEvenCountsVector;
+    std::sort(sortedEvenCounts.begin(), sortedEvenCounts.end());
+    int medianEvenIndex = sortedEvenCounts.size() / 2;
+    distribution.medianEven = (sortedEvenCounts.size() % 2 == 0) ? (double)(sortedEvenCounts[medianEvenIndex - 1] + sortedEvenCounts[medianEvenIndex]) / 2.0 : sortedEvenCounts[medianEvenIndex];
+    int q1EvenIndex = sortedEvenCounts.size() * 0.25;
+    int q3EvenIndex = sortedEvenCounts.size() * 0.75;
+    distribution.lowerRangeEven = sortedEvenCounts[q1EvenIndex];
+    distribution.upperRangeEven = sortedEvenCounts[q3EvenIndex];
+
+
+    double totalOddCount = 0;
+    for (int count : drawOddCountsVector) {
+        totalOddCount += count;
+        if (count < distribution.minOddCountsInDraws) distribution.minOddCountsInDraws = count;
+        if (count > distribution.maxOddCountsInDraws) distribution.maxOddCountsInDraws = count;
+    }
+    distribution.averageOdd = totalOddCount / drawOddCountsVector.size();
+
+    std::vector<int> sortedOddCounts = drawOddCountsVector;
+    std::sort(sortedOddCounts.begin(), sortedOddCounts.end());
+    int medianOddIndex = sortedOddCounts.size() / 2;
+    distribution.medianOdd = (sortedOddCounts.size() % 2 == 0) ? (double)(sortedOddCounts[medianOddIndex - 1] + sortedOddCounts[medianOddIndex]) / 2.0 : sortedOddCounts[medianOddIndex];
+    int q1OddIndex = sortedOddCounts.size() * 0.25;
+    int q3OddIndex = sortedOddCounts.size() * 0.75;
+    distribution.lowerRangeOdd = sortedOddCounts[q1OddIndex];
+    distribution.upperRangeOdd = sortedOddCounts[q3OddIndex];
+
+    return distribution;
+}
+
+void generateAndGetSequence(int *selectedNumbers, String &sequenceStr, int minSum, int maxSum, int sumTolerancePercent, int minEven, int maxEven, int minOdd, int maxOdd, bool balanceEvenOdd) {
+    int numbers[TOTAL_NUMBERS];
+    int evenCount = 0;
+    int oddCount = 0;
+    sequenceStr = "";
+    bool useFrequency = (currentFrequencyInfluence > 0);
+    bool usePairFrequency = (currentPairFrequencyInfluence > 0);
+    bool useHotCold = (currentHotColdInfluence > 0); // Проверяем, включено ли влияние горячих/холодных чисел
+    int generationAttempts = 0;
+    bool isSelected[TOTAL_NUMBERS + 1] = {false};
+
+    do {
+        evenCount = 0;
+        oddCount = 0;
+        sequenceStr = "";
+        generationAttempts++;
+        memset(isSelected, false, sizeof(isSelected));
+
+        for (int i = 0; i < TOTAL_NUMBERS; i++) numbers[i] = i + 1;
+        shuffleArray(numbers, TOTAL_NUMBERS);
+
+        int selectedCount = 0;
+        int index = 0;
+        while (selectedCount < NUM_SELECTED_NUMBERS && index < TOTAL_NUMBERS) {
+            int num = numbers[index];
+            bool shouldSelectBasedOnFrequency = !useFrequency;
+            bool shouldSelectBasedOnPairFrequency = !usePairFrequency;
+            bool shouldSelectBasedOnHotCold = !useHotCold; // Default to not using hot/cold if influence is 0
+
+            if (useFrequency) {
+                double frequencyWeight = frequencyData.weightedFrequency[num];
+                double intervalWeight = (frequencyData.intervalSinceLastDraw[num] > 0) ? (1.0 / (double)frequencyData.intervalSinceLastDraw[num]) : 0.1;
+                double normalizedFrequencyWeight = frequencyWeight / (double)currentDrawsToAnalyze;
+                double normalizedIntervalWeight = intervalWeight;
+                double combinedWeight = (normalizedFrequencyWeight * (currentFrequencyWeightPercent / 100.0)) + (normalizedIntervalWeight * (currentIntervalWeightPercent / 100.0));
+                shouldSelectBasedOnFrequency = (random(100) < (combinedWeight * 100));
+            }
+
+            if (usePairFrequency) {
+                double pairFrequencyScore = 0;
+                for (int selectedNumIndex = 0; selectedNumIndex < selectedCount; ++selectedNumIndex) {
+                    int selectedNum = selectedNumbers[selectedNumIndex];
+                    pairFrequencyScore += pairFrequency[min(num, selectedNum)][max(num, selectedNum)];
+                }
+                double normalizedPairFrequencyWeight = (pairFrequencyScore > 0) ? (double)pairFrequencyScore / (double)currentDrawsToAnalyze : 0; // Normalize pair frequency score
+                shouldSelectBasedOnPairFrequency = (random(100) < (normalizedPairFrequencyWeight * (currentPairFrequencyInfluence))); // Adjust threshold as needed, influence is now percentage
+            }
+
+            // --- ЛОГИКА ДЛЯ ГОРЯЧИХ И ХОЛОДНЫХ ЧИСЕЛ ---
+            if (useHotCold) {
+                double hotColdWeight = 0;
+                if (frequencyData.isHot[num]) {
+                    hotColdWeight = 1.0; // Вес для горячих чисел
+                } else if (frequencyData.isCold[num]) {
+                    hotColdWeight = -0.5; // Отрицательный вес для холодных чисел (уменьшаем вероятность выбора)
+                }
+                shouldSelectBasedOnHotCold = (random(100) < ((0.5 + hotColdWeight * (currentHotColdInfluence / 100.0)) * 100)); // 0.5 - базовая вероятность, +- влияние Г/Х
+            }
+
+
+            if ((!useFrequency || shouldSelectBasedOnFrequency) &&
+                (!usePairFrequency || shouldSelectBasedOnPairFrequency) &&
+                (!useHotCold || shouldSelectBasedOnHotCold)) { // Комбинируем все условия
+
+                    if (!isSelected[num]) {
+                        if (num % 2 == 0 && evenCount < maxEven) {
+                            selectedNumbers[selectedCount] = num;
+                            evenCount++;
+                            isSelected[num] = true;
+                            selectedCount++;
+                        } else if (num % 2 != 0 && oddCount < maxOdd) {
+                            selectedNumbers[selectedCount] = num;
+                            oddCount++;
+                            isSelected[num] = true;
+                            selectedCount++;
+                        }
+                    }
+            }
+            index++;
+        }
+
+        index = 0;
+        while (selectedCount < NUM_SELECTED_NUMBERS && index < TOTAL_NUMBERS) {
+            int num = numbers[index];
+            if (!isSelected[num]) {
+                if (num % 2 == 0 && evenCount < maxEven) {
+                    selectedNumbers[selectedCount] = num;
+                    evenCount++;
+                    isSelected[num] = true;
+                    selectedCount++;
+                } else if (num % 2 != 0 && oddCount < maxOdd) {
+                    selectedNumbers[selectedCount] = num;
+                    oddCount++;
+                    isSelected[num] = true;
+                    selectedCount++;
+                }
+            }
+            index++;
+        }
+
+        if (balanceEvenOdd && !((evenCount >= minEven && evenCount <= maxEven) && (oddCount >= minOdd && oddCount <= maxOdd))) continue;
+        if (!balanceEvenOdd && !((evenCount + oddCount) == NUM_SELECTED_NUMBERS)) continue;
+
+        int sequenceSum = 0;
+        for (int i = 0; i < NUM_SELECTED_NUMBERS; i++) sequenceSum += selectedNumbers[i];
+
+        if (sequenceSum >= minSum && sequenceSum <= maxSum) {
+            for (int i = 0; i < NUM_SELECTED_NUMBERS; i++) {
+                sequenceStr += selectedNumbers[i];
+                if (i < NUM_SELECTED_NUMBERS - 1) sequenceStr += ", ";
+            }
+            sequenceStr += "\nЧетных: " + String(evenCount) + ", Нечетных: " + String(oddCount) + ", Сумма: " + String(sequenceSum);
+            return;
+        }
+    } while (generationAttempts < 100);
+
+    sequenceStr = "Не удалось сгенерировать последовательность с заданными параметрами после " + String(generationAttempts) + " попыток.";
+    errorMessageForWebpage = sequenceStr;
+    successMessageForWebpage = "";
+}
+
+
+void shuffleArray(int *array, int size) {
+    for (int i = size - 1; i > 0; i--) {
+        int j = random(0, i + 1);
+        int temp = array[i];
+        array[i] = array[j];
+        array[j] = temp;
+    }
+}
+
+long sumLine(String line) {
+    long sum = 0;
+    int numbers[NUM_SELECTED_NUMBERS];
+    int count = parseNumbers(line, numbers);
+    for (int i = 0; i < count; i++) sum += numbers[i];
+    return sum;
+}
